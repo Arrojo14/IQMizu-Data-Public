@@ -1,0 +1,18 @@
+{
+  "name": "embalses-data-public",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "scripts": {
+    "data:update": "node scripts/sync-data.mjs",
+    "data:update:scheduled": "node scripts/run-scheduled-update.mjs",
+    "data:summary": "node scripts/print-summary.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.6.2",
+    "mdb-reader": "^3.2.0"
+  }
+}
