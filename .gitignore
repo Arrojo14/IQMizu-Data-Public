@@ -1,7 +1,7 @@
 node_modules/
 data/BD-Embalses-update/
 data/BD-Embalses-update.zip
-data/*.wal
-data/*.shm
+data/*-wal
+data/*-shm
 data/cache/*.tmp
 .update-data.lock
