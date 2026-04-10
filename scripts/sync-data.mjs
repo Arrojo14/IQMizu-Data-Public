@@ -11,8 +11,11 @@ import {
 } from "node:fs";
 import { execFileSync, spawnSync } from "node:child_process";
 import { join, resolve } from "node:path";
+import { refreshAemetCaches } from "./refresh-aemet-cache.mjs";
 
 const DB_PATH = resolve("data/embalses.db");
+const DB_WAL_PATH = `${DB_PATH}-wal`;
+const DB_SHM_PATH = `${DB_PATH}-shm`;
 const DATA_DIR = resolve("data");
 const ZIP_URL =
   "https://www.miteco.gob.es/content/dam/miteco/es/agua/temas/evaluacion-de-los-recursos-hidricos/boletin-hidrologico/Historico-de-embalses/BD-Embalses.zip";
@@ -344,6 +347,28 @@ function printSummary(db) {
   console.log(`DB: ${DB_PATH}`);
 }
 
+function getDbDateRange(db) {
+  const latest = db.prepare("SELECT MAX(fecha) AS latestDate FROM datos_semanales").get();
+  const earliest = db.prepare("SELECT MIN(fecha) AS earliestDate FROM datos_semanales").get();
+  return {
+    latestDate: latest?.latestDate ?? null,
+    earliestDate: earliest?.earliestDate ?? null,
+  };
+}
+
+function checkpointDatabase(db) {
+  const result = db.pragma("wal_checkpoint(TRUNCATE)", { simple: false });
+  console.log(`[db] WAL checkpoint ejecutado: ${JSON.stringify(result)}`);
+}
+
+function cleanupDbSidecars() {
+  for (const filePath of [DB_WAL_PATH, DB_SHM_PATH]) {
+    if (existsSync(filePath)) {
+      unlinkSync(filePath);
+    }
+  }
+}
+
 function cleanup() {
   try {
     if (existsSync(ZIP_PATH)) unlinkSync(ZIP_PATH);
@@ -359,6 +384,7 @@ async function main() {
   mkdirSync(DATA_DIR, { recursive: true });
 
   let db;
+  let dbExistedBeforeOpen = existsSync(DB_PATH);
   try {
     await downloadFile(ZIP_URL, ZIP_PATH);
     extractZip(ZIP_PATH, EXTRACT_DIR);
@@ -380,18 +406,37 @@ async function main() {
     db.pragma("journal_mode = WAL");
     db.pragma("synchronous = OFF");
 
-    if (!existsSync(DB_PATH) || !db.prepare(
-      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'datos_semanales'"
-    ).get()) {
+    const hasWeeklyTable = Boolean(
+      db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'datos_semanales'")
+        .get()
+    );
+    const beforeRange = dbExistedBeforeOpen && hasWeeklyTable ? getDbDateRange(db) : null;
+    if (beforeRange) {
+      console.log(`[db] Antes de actualizar: ${beforeRange.earliestDate} -> ${beforeRange.latestDate}`);
+    } else {
+      console.log("[db] No existe DB previa. Se creara desde cero.");
+    }
+
+    if (!dbExistedBeforeOpen || !hasWeeklyTable) {
       buildFreshDatabase(db, rows);
     } else {
       updateExistingDatabase(db, rows);
     }
 
+    const afterRange = getDbDateRange(db);
+    console.log(`[db] Despues de actualizar: ${afterRange.earliestDate} -> ${afterRange.latestDate}`);
     printSummary(db);
+    checkpointDatabase(db);
   } finally {
     if (db) db.close();
+    cleanupDbSidecars();
     cleanup();
+  }
+
+  const aemetSummary = await refreshAemetCaches();
+  if (aemetSummary) {
+    console.log(`[aemet-cache] Resumen final: ${JSON.stringify(aemetSummary)}`);
   }
 }
 

@@ -1,4 +1,4 @@
-name: Update embalses DB
+name: Update public data
 
 on:
   schedule:
@@ -30,16 +30,34 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      - name: Update DB
+      - name: Update data artifacts
+        env:
+          AEMET_API_KEY: ${{ secrets.AEMET_API_KEY }}
         run: npm run data:update:scheduled
 
       - name: Print summary
         run: npm run data:summary
 
-      - name: Commit updated DB
+      - name: Show artifact status
+        run: |
+          git status --short
+          if [ -f data/embalses.db ]; then
+            sha256sum data/embalses.db
+            du -h data/embalses.db
+          fi
+          if [ -f data/cache/aemet-recent-climate-30.json ]; then
+            sha256sum data/cache/aemet-recent-climate-30.json
+            du -h data/cache/aemet-recent-climate-30.json
+          fi
+          monthly_count=$(find data/cache -maxdepth 1 -type f -name 'aemet-monthly-*.json' | wc -l)
+          echo "monthly cache files: ${monthly_count}"
+
+      - name: Commit updated artifacts
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/embalses.db
-          git commit -m "chore: refresh embalses db" || exit 0
+          git add data/embalses.db data/cache/
+          git status --short
+          git diff --cached --stat
+          git commit -m "chore: refresh embalses and AEMET cache" || exit 0
           git push

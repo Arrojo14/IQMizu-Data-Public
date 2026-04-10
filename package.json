@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "data:update": "node scripts/sync-data.mjs",
+    "data:update:aemet": "node scripts/refresh-aemet-cache.mjs",
     "data:update:scheduled": "node scripts/run-scheduled-update.mjs",
     "data:summary": "node scripts/print-summary.mjs"
   },
