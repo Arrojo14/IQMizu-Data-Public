@@ -30,6 +30,16 @@ jobs:
       - name: Install dependencies
         run: npm install
 
+      - name: Check AEMET secret
+        env:
+          AEMET_API_KEY: ${{ secrets.AEMET_API_KEY }}
+        run: |
+          if [ -z "$AEMET_API_KEY" ]; then
+            echo "Falta el secreto de Actions AEMET_API_KEY en el repositorio." >&2
+            echo "GitHub -> Settings -> Secrets and variables -> Actions -> New repository secret" >&2
+            exit 1
+          fi
+
       - name: Update data artifacts
         env:
           AEMET_API_KEY: ${{ secrets.AEMET_API_KEY }}
