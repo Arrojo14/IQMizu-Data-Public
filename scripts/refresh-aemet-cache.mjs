@@ -13,6 +13,7 @@ import { fileURLToPath } from "node:url";
 const AEMET_BASE = "https://opendata.aemet.es/opendata";
 const CACHE_DIR = resolve("data", "cache");
 const MONTHLY_PREFIX = "aemet-monthly-";
+const AEMET_WEB_BASE = "https://www.aemet.es";
 const RECENT_RANGE_DAYS = Number(process.env.AEMET_RECENT_RANGE_DAYS || 30);
 const LOOKBACK_DAYS = Number(process.env.AEMET_HISTORY_RANGE_DAYS || 364);
 const REQUEST_TIMEOUT_MS = Number(process.env.AEMET_REQUEST_TIMEOUT_MS || 12_000);
@@ -20,6 +21,11 @@ const MAX_ALL_STATIONS_DAILY_RANGE_DAYS = 15;
 const STATION_CACHE_LIMIT = Number(process.env.STATION_CACHE_LIMIT || 0);
 const MAX_RETRIES = Number(process.env.STATION_CACHE_MAX_RETRIES || 6);
 const CHUNK_DELAY_MS = Number(process.env.STATION_CACHE_CHUNK_DELAY_MS || 1500);
+const RECENT_OBS_OVERLAY_ENABLED = process.env.AEMET_RECENT_OBS_OVERLAY !== "0";
+const RECENT_OBS_CONCURRENCY = Number(process.env.AEMET_RECENT_OBS_CONCURRENCY || 4);
+const RECENT_OBS_DELAY_MS = Number(process.env.AEMET_RECENT_OBS_DELAY_MS || 100);
+const RECENT_OBS_MAX_RETRIES = Number(process.env.AEMET_RECENT_OBS_MAX_RETRIES || 3);
+const RECENT_OBS_TIMEOUT_MS = Number(process.env.AEMET_RECENT_OBS_TIMEOUT_MS || REQUEST_TIMEOUT_MS);
 const AEMET_REQUIRED = process.env.AEMET_REQUIRED !== "0";
 
 loadEnvFile(resolve(".env.local"));
@@ -63,6 +69,12 @@ function validatePositiveInteger(name, value, minimum = 1) {
   }
 }
 
+function validateNonNegativeInteger(name, value) {
+  if (!Number.isInteger(value) || value < 0) {
+    throw new Error(`${name} no es valido.`);
+  }
+}
+
 function decodeJsonBuffer(buffer) {
   const text = new TextDecoder("iso-8859-15").decode(buffer);
   return JSON.parse(text);
@@ -100,6 +112,16 @@ function parseNullableNumber(value) {
   if (!normalized || normalized === "Ip") return 0;
 
   const parsed = Number.parseFloat(normalized.replace(/\./g, "").replace(/,/g, "."));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function parseCsvNumber(value) {
+  if (typeof value !== "string") return null;
+
+  const normalized = value.trim();
+  if (!normalized || normalized === "Ip") return 0;
+
+  const parsed = Number.parseFloat(normalized.replace(",", "."));
   return Number.isFinite(parsed) ? parsed : null;
 }
 
@@ -191,6 +213,249 @@ async function fetchAemetData(endpoint) {
   }
 
   throw new Error("Unexpected retry flow");
+}
+
+function decodeCsvBuffer(buffer) {
+  return new TextDecoder("iso-8859-15").decode(buffer);
+}
+
+function parseCsvLine(line) {
+  const fields = [];
+  let current = "";
+  let quoted = false;
+
+  for (let index = 0; index < line.length; index += 1) {
+    const char = line[index];
+    const next = line[index + 1];
+
+    if (char === '"') {
+      if (quoted && next === '"') {
+        current += '"';
+        index += 1;
+      } else {
+        quoted = !quoted;
+      }
+      continue;
+    }
+
+    if (char === "," && !quoted) {
+      fields.push(current);
+      current = "";
+      continue;
+    }
+
+    current += char;
+  }
+
+  fields.push(current);
+  return fields.map((field) => field.trim());
+}
+
+function parseSpanishSummaryDate(value) {
+  const match = value
+    .trim()
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/\./g, "")
+    .match(/^(\d{1,2})\s+([a-z]+)\s+(\d{4})$/);
+
+  if (!match) return null;
+
+  const [, dayRaw, monthRaw, yearRaw] = match;
+  const months = new Map([
+    ["ene", "01"],
+    ["enero", "01"],
+    ["feb", "02"],
+    ["febrero", "02"],
+    ["mar", "03"],
+    ["marzo", "03"],
+    ["abr", "04"],
+    ["abril", "04"],
+    ["may", "05"],
+    ["mayo", "05"],
+    ["jun", "06"],
+    ["junio", "06"],
+    ["jul", "07"],
+    ["julio", "07"],
+    ["ago", "08"],
+    ["agosto", "08"],
+    ["sep", "09"],
+    ["sept", "09"],
+    ["septiembre", "09"],
+    ["oct", "10"],
+    ["octubre", "10"],
+    ["nov", "11"],
+    ["noviembre", "11"],
+    ["dic", "12"],
+    ["diciembre", "12"],
+  ]);
+  const month = months.get(monthRaw);
+  const day = dayRaw.padStart(2, "0");
+
+  return month ? `${yearRaw}-${month}-${day}` : null;
+}
+
+function parseRecentObservationCsv(csvText) {
+  const lines = csvText
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const headerIndex = lines.findIndex((line) => line.includes("Precipitaci"));
+  if (headerIndex === -1) return [];
+
+  const points = [];
+  for (const line of lines.slice(headerIndex + 1)) {
+    const fields = parseCsvLine(line);
+    if (fields.length < 7) continue;
+
+    const fecha = parseSpanishSummaryDate(fields[0]);
+    if (!fecha) continue;
+
+    points.push({
+      fecha,
+      precipitacion: parseCsvNumber(fields[6]) ?? 0,
+      temperaturaMedia: parseCsvNumber(fields[3]),
+      humedadMedia: null,
+    });
+  }
+
+  return sortDailyPoints(points);
+}
+
+function isRetryableRecentObservationError(error) {
+  return (
+    error instanceof Error &&
+    (error.message.includes("AEMET recent observations error: 429") ||
+      error.message.includes("AEMET recent observations error: 500") ||
+      error.message.includes("AEMET recent observations timeout"))
+  );
+}
+
+async function fetchRecentObservationCsvOnce(indicativo) {
+  const encodedIndicativo = encodeURIComponent(indicativo);
+  const url = `${AEMET_WEB_BASE}/es/eltiempo/observacion/ultimosdatos_${encodedIndicativo}_resumenes-diarios-anteriores.csv?l=${encodedIndicativo}&datos=det&w=2&f=tmax&x=`;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), RECENT_OBS_TIMEOUT_MS);
+
+  let res;
+  try {
+    res = await fetch(url, {
+      headers: {
+        accept: "text/csv,text/plain,*/*",
+        "user-agent": "IQMizu data updater (https://iqmizu.com)",
+      },
+      cache: "no-store",
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      throw new Error("AEMET recent observations timeout");
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+
+  if (!res.ok) {
+    throw new Error(`AEMET recent observations error: ${res.status}`);
+  }
+
+  return decodeCsvBuffer(await res.arrayBuffer());
+}
+
+async function fetchRecentObservationCsv(indicativo) {
+  for (let attempt = 1; attempt <= RECENT_OBS_MAX_RETRIES; attempt += 1) {
+    try {
+      return await fetchRecentObservationCsvOnce(indicativo);
+    } catch (error) {
+      if (!isRetryableRecentObservationError(error) || attempt === RECENT_OBS_MAX_RETRIES) {
+        throw error;
+      }
+
+      await sleep(Math.min(15_000, 2000 * attempt));
+    }
+  }
+
+  throw new Error("Unexpected recent observations retry flow");
+}
+
+function getLatestPointDate(points) {
+  return points.length > 0 ? points[points.length - 1].fecha : null;
+}
+
+async function runWithConcurrency(items, concurrency, worker) {
+  let index = 0;
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (index < items.length) {
+      const item = items[index];
+      index += 1;
+      await worker(item);
+    }
+  });
+
+  await Promise.all(workers);
+}
+
+async function overlayRecentObservationSummaries(pointsByStation, indicativos, latestClosedDate) {
+  const candidates = indicativos.filter((indicativo) => {
+    const latest = getLatestPointDate(pointsByStation.get(indicativo) ?? []);
+    return latest === null || latest < latestClosedDate;
+  });
+
+  let fetched = 0;
+  let skippedUpToDate = indicativos.length - candidates.length;
+  let updatedStations = 0;
+  let addedRows = 0;
+  let failed = 0;
+  const failures = [];
+
+  console.log(
+    `[aemet-cache] Overlay provisional AEMET web: ${candidates.length} estaciones candidatas (${skippedUpToDate} al dia).`
+  );
+
+  await runWithConcurrency(candidates, RECENT_OBS_CONCURRENCY, async (indicativo) => {
+    try {
+      if (RECENT_OBS_DELAY_MS > 0) {
+        await sleep(RECENT_OBS_DELAY_MS);
+      }
+
+      const existingPoints = pointsByStation.get(indicativo) ?? [];
+      const existingDates = new Set(existingPoints.map((point) => point.fecha));
+      const csvText = await fetchRecentObservationCsv(indicativo);
+      fetched += 1;
+
+      const overlayPoints = parseRecentObservationCsv(csvText).filter(
+        (point) => point.fecha <= latestClosedDate && !existingDates.has(point.fecha)
+      );
+
+      if (overlayPoints.length === 0) return;
+
+      pointsByStation.set(indicativo, sortDailyPoints([...existingPoints, ...overlayPoints]));
+      updatedStations += 1;
+      addedRows += overlayPoints.length;
+    } catch (error) {
+      failed += 1;
+      if (failures.length < 10) {
+        failures.push({
+          indicativo,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  });
+
+  return {
+    enabled: true,
+    latestClosedDate,
+    candidates: candidates.length,
+    skippedUpToDate,
+    fetched,
+    updatedStations,
+    addedRows,
+    failed,
+    failures,
+  };
 }
 
 async function fetchObservations() {
@@ -324,6 +589,10 @@ export async function refreshAemetCaches() {
   validatePositiveInteger("AEMET_HISTORY_RANGE_DAYS", LOOKBACK_DAYS);
   validatePositiveInteger("AEMET_REQUEST_TIMEOUT_MS", REQUEST_TIMEOUT_MS);
   validatePositiveInteger("STATION_CACHE_MAX_RETRIES", MAX_RETRIES);
+  validatePositiveInteger("AEMET_RECENT_OBS_CONCURRENCY", RECENT_OBS_CONCURRENCY);
+  validatePositiveInteger("AEMET_RECENT_OBS_MAX_RETRIES", RECENT_OBS_MAX_RETRIES);
+  validatePositiveInteger("AEMET_RECENT_OBS_TIMEOUT_MS", RECENT_OBS_TIMEOUT_MS);
+  validateNonNegativeInteger("AEMET_RECENT_OBS_DELAY_MS", RECENT_OBS_DELAY_MS);
 
   if (RECENT_RANGE_DAYS > LOOKBACK_DAYS + 1) {
     throw new Error("AEMET_RECENT_RANGE_DAYS no puede ser mayor que el historico descargado.");
@@ -396,6 +665,10 @@ export async function refreshAemetCaches() {
   }
 
   const finalized = finalizeDailyPoints(merged);
+  const latestClosedDate = formatAemetDate(endDate);
+  const recentObservationOverlay = RECENT_OBS_OVERLAY_ENABLED
+    ? await overlayRecentObservationSummaries(finalized, indicativos, latestClosedDate)
+    : { enabled: false };
   const timestamp = Date.now();
   const recentPayload = buildRecentClimatePayload(finalized, RECENT_RANGE_DAYS, timestamp);
   const recentFilePath = join(CACHE_DIR, `aemet-recent-climate-${RECENT_RANGE_DAYS}.json`);
@@ -407,6 +680,13 @@ export async function refreshAemetCaches() {
   console.log(`[aemet-cache] Cache reciente actualizada: ${recentFilePath}`);
   console.log(`[aemet-cache] Estaciones con historico: ${populatedStationCount}/${indicativos.length}`);
   console.log(`[aemet-cache] Ficheros mensuales regenerados: ${monthlyFileCount}`);
+  if (recentObservationOverlay.enabled) {
+    console.log(
+      `[aemet-cache] Overlay provisional: ${recentObservationOverlay.addedRows} filas nuevas en ${recentObservationOverlay.updatedStations} estaciones; fallos ${recentObservationOverlay.failed}.`
+    );
+  } else {
+    console.log("[aemet-cache] Overlay provisional desactivado.");
+  }
 
   return {
     cacheDir: CACHE_DIR,
@@ -417,6 +697,7 @@ export async function refreshAemetCaches() {
     monthlyFileCount,
     chunkCount,
     totalRawRows,
+    recentObservationOverlay,
   };
 }
 

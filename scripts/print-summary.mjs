@@ -43,9 +43,19 @@ db.close();
 const recentPath = join(CACHE_DIR, `aemet-recent-climate-${RECENT_RANGE_DAYS}.json`);
 if (existsSync(recentPath)) {
   const parsed = JSON.parse(readFileSync(recentPath, "utf8"));
+  let latestDate = null;
+  for (const points of Object.values(parsed?.data ?? {})) {
+    if (!Array.isArray(points)) continue;
+    for (const point of points) {
+      if (typeof point?.fecha === "string" && (latestDate === null || point.fecha > latestDate)) {
+        latestDate = point.fecha;
+      }
+    }
+  }
   summary.aemetRecent = {
     filePath: recentPath,
     rangeDays: parsed?.rangeDays ?? null,
+    latestDate,
     timestamp:
       typeof parsed?.timestamp === "number"
         ? new Date(parsed.timestamp).toISOString()
