@@ -19,10 +19,11 @@ No incluye:
 
 ## Que hace
 
-El flujo descarga el ZIP oficial de MITECO, localiza el `.mdb`, y:
+El flujo descarga el ZIP oficial de MITECO, localiza el `.mdb`, consulta el boletin provisional de BoleHWeb, y:
 
 - crea `data/embalses.db` desde cero si no existe
 - o la actualiza incrementalmente si ya existe
+- aplica la ultima fecha provisional disponible en BoleHWeb cuando el ZIP oficial va con retraso
 - refresca el historico diario reciente de lluvia de AEMET para las estaciones activas
 - recalcula el acumulado mensual de AEMET a partir del historico diario
 

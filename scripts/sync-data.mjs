@@ -22,6 +22,86 @@ const ZIP_URL =
 const ZIP_PATH = join(DATA_DIR, "BD-Embalses-update.zip");
 const EXTRACT_DIR = join(DATA_DIR, "BD-Embalses-update");
 const TABLE_NAME = "T_Datos Embalses 1988-2026";
+const PROVISIONAL_REQUIRED = process.env.PROVISIONAL_REQUIRED !== "0";
+const PROVISIONAL_BACKFILL_MAX_DAYS = Number(process.env.PROVISIONAL_BACKFILL_MAX_DAYS || 120);
+
+function addDays(date, days) {
+  const next = new Date(date);
+  next.setDate(next.getDate() + days);
+  return next;
+}
+
+function formatBolehDate(date) {
+  return `${date.getDate()}/${date.getMonth() + 1}/${date.getFullYear()}`;
+}
+
+function parseIsoDate(value) {
+  const date = new Date(`${value}T00:00:00Z`);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function getLatestDbDate() {
+  const db = new Database(DB_PATH, { readonly: true });
+  try {
+    return db.prepare("SELECT MAX(fecha) AS fecha FROM datos_semanales").get()?.fecha ?? null;
+  } finally {
+    db.close();
+  }
+}
+
+function runProvisionalUpdate(requestedDate = null) {
+  console.log(
+    `\nEjecutando actualizacion provisional (BoleHWeb)${requestedDate ? ` para ${requestedDate}` : ""}...`
+  );
+  try {
+    execFileSync(process.execPath, [resolve("scripts/update-provisional.mjs")], {
+      stdio: "inherit",
+      env: requestedDate ? { ...process.env, BOLEH_DATE: requestedDate } : process.env,
+    });
+  } catch (error) {
+    const details = String(error?.message || error);
+    if (PROVISIONAL_REQUIRED) {
+      throw new Error(
+        "La actualizacion provisional fallo y PROVISIONAL_REQUIRED no es 0.\n" + details
+      );
+    }
+    console.warn("Aviso: no se pudo completar la actualizacion provisional.");
+    console.warn(details);
+  }
+}
+
+function runProvisionalBackfill() {
+  if (!Number.isFinite(PROVISIONAL_BACKFILL_MAX_DAYS) || PROVISIONAL_BACKFILL_MAX_DAYS < 0) {
+    throw new Error("PROVISIONAL_BACKFILL_MAX_DAYS no es valido.");
+  }
+
+  const latestDbDate = getLatestDbDate();
+  const today = new Date();
+  const requestedDates = [];
+
+  if (latestDbDate) {
+    const latest = parseIsoDate(latestDbDate);
+    if (latest) {
+      const minStart = addDays(today, -PROVISIONAL_BACKFILL_MAX_DAYS);
+      let cursor = addDays(latest, 7);
+      if (cursor < minStart) cursor = minStart;
+
+      while (cursor <= today) {
+        requestedDates.push(formatBolehDate(cursor));
+        cursor = addDays(cursor, 7);
+      }
+    }
+  }
+
+  const todayFormatted = formatBolehDate(today);
+  if (!requestedDates.includes(todayFormatted)) {
+    requestedDates.push(todayFormatted);
+  }
+
+  for (const requestedDate of requestedDates) {
+    runProvisionalUpdate(requestedDate);
+  }
+}
 
 async function downloadFile(url, dest) {
   console.log(`Descargando ${url}...`);
@@ -433,6 +513,8 @@ async function main() {
     cleanupDbSidecars();
     cleanup();
   }
+
+  runProvisionalBackfill();
 
   const aemetSummary = await refreshAemetCaches();
   if (aemetSummary) {
