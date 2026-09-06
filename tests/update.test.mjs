@@ -51,6 +51,21 @@ test("same reservoir name in different basins remains distinct", (t) => {
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM embalses").get().n, 2);
 });
 
+test("migration removes redundant indexes and remains idempotent", (t) => {
+  const db = memory(t);
+  importOfficialRows(db, week(), "hash");
+  db.exec(`CREATE INDEX idx_datos_embalse ON datos_semanales(embalse_id);
+    CREATE INDEX idx_datos_embalse_fecha ON datos_semanales(embalse_id, fecha);`);
+  const before = getSnapshot(db);
+  createSchema(db);
+  const indexes = db.prepare("PRAGMA index_list(datos_semanales)").all().map((index) => index.name).sort();
+  assert.deepEqual(indexes, ["idx_datos_embalse_fecha_unique", "idx_datos_fecha"]);
+  assert.deepEqual(getSnapshot(db), before);
+  const migrated = db.serialize();
+  createSchema(db);
+  assert.deepEqual(db.serialize(), migrated);
+});
+
 test("incomplete or implausible official weeks do not change rows or successful hash", (t) => {
   const db = memory(t);
   importOfficialRows(db, week(), "good");
@@ -140,8 +155,10 @@ test("live MITECO archive updates a copy and skips parsing on repeat", { skip: p
   const firstStart = performance.now();
   const first = await syncData({ dbPath });
   const firstMs = performance.now() - firstStart;
+  const published = readFileSync(dbPath);
   const repeatStart = performance.now();
   const repeat = await syncData({ dbPath, readRows: () => { throw new Error("Unchanged archive was parsed again"); } });
   assert.deepEqual(repeat, first);
-  console.log(JSON.stringify({ firstMs, repeatMs: performance.now() - repeatStart, snapshot: repeat }));
+  assert.deepEqual(readFileSync(dbPath), published);
+  console.log(JSON.stringify({ firstMs, repeatMs: performance.now() - repeatStart, bytes: published.length, snapshot: repeat }));
 });

@@ -32,6 +32,14 @@ export function createSchema(db) {
   if (!db.prepare("PRAGMA table_info(datos_semanales)").all().some((column) => column.name === "fuente")) {
     db.exec("ALTER TABLE datos_semanales ADD COLUMN fuente TEXT NOT NULL DEFAULT 'legacy'");
   }
+  // The unique (reservoir, date) index also serves both old lookup indexes.
+  // Compact only during this migration, not on every scheduled run.
+  const oldIndexes = db.prepare("PRAGMA index_list(datos_semanales)").all()
+    .some((index) => ["idx_datos_embalse", "idx_datos_embalse_fecha"].includes(index.name));
+  if (oldIndexes) {
+    db.exec("DROP INDEX IF EXISTS idx_datos_embalse; DROP INDEX IF EXISTS idx_datos_embalse_fecha;");
+    db.exec("VACUUM");
+  }
 }
 
 export function getState(db, key) {
