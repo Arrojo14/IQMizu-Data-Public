@@ -1,18 +1,13 @@
 import {
   existsSync,
-  mkdirSync,
   readFileSync,
-  readdirSync,
-  renameSync,
-  unlinkSync,
-  writeFileSync,
 } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
+import { installWeatherFiles, readWeatherFiles } from "./weather-publication.mjs";
 import { fileURLToPath } from "node:url";
 
 const AEMET_BASE = "https://opendata.aemet.es/opendata";
 const CACHE_DIR = resolve("data", "cache");
-const MONTHLY_PREFIX = "aemet-monthly-";
 const AEMET_WEB_BASE = "https://www.aemet.es";
 const RECENT_RANGE_DAYS = Number(process.env.AEMET_RECENT_RANGE_DAYS || 30);
 const LOOKBACK_DAYS = Number(process.env.AEMET_HISTORY_RANGE_DAYS || 364);
@@ -495,16 +490,6 @@ function buildMonthlyPrecipitation(points) {
     });
 }
 
-function writeJsonAtomic(filePath, value) {
-  mkdirSync(dirname(filePath), { recursive: true });
-  const tempPath = `${filePath}.tmp`;
-  writeFileSync(tempPath, JSON.stringify(value));
-  if (existsSync(filePath)) {
-    unlinkSync(filePath);
-  }
-  renameSync(tempPath, filePath);
-}
-
 function finalizeDailyPoints(pointsByStation) {
   const finalized = new Map();
 
@@ -530,30 +515,6 @@ function buildRecentClimatePayload(pointsByStation, recentRangeDays, timestamp) 
     rangeDays: recentRangeDays,
     data: Object.fromEntries(entries),
   };
-}
-
-function syncMonthlyFiles(pointsByStation, timestamp) {
-  mkdirSync(CACHE_DIR, { recursive: true });
-
-  const expectedFiles = new Set();
-  for (const [indicativo, points] of [...pointsByStation.entries()].sort(([a], [b]) =>
-    a.localeCompare(b, "es")
-  )) {
-    const fileName = `${MONTHLY_PREFIX}${safeIndicativo(indicativo)}.json`;
-    expectedFiles.add(fileName);
-    writeJsonAtomic(join(CACHE_DIR, fileName), {
-      timestamp,
-      data: buildMonthlyPrecipitation(points),
-    });
-  }
-
-  for (const entry of readdirSync(CACHE_DIR)) {
-    if (!entry.startsWith(MONTHLY_PREFIX) || !entry.endsWith(".json")) continue;
-    if (expectedFiles.has(entry)) continue;
-    unlinkSync(join(CACHE_DIR, entry));
-  }
-
-  return expectedFiles.size;
 }
 
 export async function refreshAemetCaches() {
@@ -645,8 +606,25 @@ export async function refreshAemetCaches() {
   const recentPayload = buildRecentClimatePayload(finalized, RECENT_RANGE_DAYS, timestamp);
   const recentFilePath = join(CACHE_DIR, `aemet-recent-climate-${RECENT_RANGE_DAYS}.json`);
 
-  writeJsonAtomic(recentFilePath, recentPayload);
-  const monthlyFileCount = syncMonthlyFiles(finalized, timestamp);
+  // Keep last-known history for dormant/missing stations. A partial upstream
+  // response must not erase earlier published months or station history.
+  const files = existsSync(CACHE_DIR) ? readWeatherFiles(CACHE_DIR) : {};
+  const previousRecent = files["aemet-recent-climate-30.json"]?.data ?? {};
+  for (const [station, points] of Object.entries(previousRecent)) {
+    const combined = new Map(points.map((point) => [point.fecha, point]));
+    for (const point of recentPayload.data[station] ?? []) combined.set(point.fecha, point);
+    recentPayload.data[station] = sortDailyPoints(combined.values()).slice(-RECENT_RANGE_DAYS);
+  }
+  for (const [station, points] of finalized) {
+    const name = `aemet-monthly-${safeIndicativo(station)}.json`;
+    const months = new Map((files[name]?.data ?? []).map((point) => [point.mes, point]));
+    for (const point of buildMonthlyPrecipitation(points)) months.set(point.mes, point);
+    files[name] = { timestamp, data: [...months.values()].sort((a, b) => a.mes.localeCompare(b.mes)).slice(-12) };
+  }
+  files["aemet-recent-climate-30.json"] = recentPayload;
+  for (const file of Object.values(files)) file.timestamp = timestamp;
+  installWeatherFiles(files, CACHE_DIR);
+  const monthlyFileCount = Object.keys(files).length - 1;
   const populatedStationCount = [...finalized.values()].filter((points) => points.length > 0).length;
 
   console.log(`[aemet-cache] Cache reciente actualizada: ${recentFilePath}`);

@@ -6,13 +6,14 @@ import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
 import { getSnapshot, validateSnapshot } from "./database-snapshot.mjs";
+import { decodeWeatherBundle, installWeatherFiles, MAX_BUNDLE_BYTES } from "./weather-publication.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 export function parsePublishCommand(command) {
-  const match = /^publish ([a-f0-9]{40}) ([a-f0-9]{64})$/.exec(command || "");
-  if (!match) throw new Error("Only 'publish <commit SHA> <database SHA-256>' is allowed.");
-  return { commit: match[1], hash: match[2] };
+  const match = /^(publish|publish-weather) ([a-f0-9]{40}) ([a-f0-9]{64})$/.exec(command || "");
+  if (!match) throw new Error("Only publish/publish-weather with exact commit and artifact hashes are allowed.");
+  return { kind: match[1], commit: match[2], hash: match[3] };
 }
 
 export function describeDatabase(db) {
@@ -84,10 +85,32 @@ export async function importWebsiteDatabase(sourcePath, dbPath, { backupPath, no
   }
 }
 
-export async function publishWebsiteData(command, { root = ROOT, fetchImpl = fetch, now = new Date() } = {}) {
-  const { commit, hash } = parsePublishCommand(command);
-  const dbPath = join(root, "data", "embalses.db");
-  const statusPath = join(root, "data", "last-github-publication.json");
+export async function publishWebsiteData(command, { root = ROOT, dbPath = resolve(root, process.env.SQLITE_DB_PATH?.trim() || "data/embalses.db"),
+  fetchImpl = fetch, now = new Date(), weatherInput = process.stdin } = {}) {
+  const { kind, commit, hash } = parsePublishCommand(command);
+  const dataDir = dirname(dbPath);
+  if (kind === "publish-weather") {
+    const chunks = [];
+    let bytes = 0;
+    const timeout = setTimeout(() => weatherInput.destroy(new Error("Weather input timeout.")), 90_000);
+    try {
+      for await (const chunk of weatherInput) {
+        bytes += chunk.length;
+        if (bytes > MAX_BUNDLE_BYTES) throw new Error("Weather input too large.");
+        chunks.push(chunk);
+      }
+    } finally { clearTimeout(timeout); }
+    const files = decodeWeatherBundle(Buffer.concat(chunks), hash, { now });
+    const statusPath = join(dataDir, "last-weather-publication.json");
+    let last;
+    try { last = JSON.parse(readFileSync(statusPath, "utf8")); } catch { /* First publication. */ }
+    const result = installWeatherFiles(files, join(dataDir, "cache"), { now });
+    if (last?.hash === hash && result.changes === 0) return result;
+    completePublication(root, statusPath, { commit, hash, ...result });
+    console.log(`[weather] PUBLISHED ${JSON.stringify(result)}`);
+    return result;
+  }
+  const statusPath = join(dataDir, "last-github-publication.json");
   let last;
   try { last = JSON.parse(readFileSync(statusPath, "utf8")); } catch { /* First publication. */ }
   const live = new Database(dbPath, { readonly: true, fileMustExist: true });
@@ -99,7 +122,7 @@ export async function publishWebsiteData(command, { root = ROOT, fetchImpl = fet
     return { after: current, changes: 0 };
   }
 
-  const work = mkdtempSync(join(root, "data", ".github-publication-"));
+  const work = mkdtempSync(join(dataDir, ".github-publication-"));
   try {
     const url = `https://raw.githubusercontent.com/Arrojo14/IQMizu-Data-Public/${commit}/data/embalses.db`;
     let buffer;
@@ -118,21 +141,24 @@ export async function publishWebsiteData(command, { root = ROOT, fetchImpl = fet
     const sourcePath = join(work, "incoming.db");
     writeFileSync(sourcePath, buffer);
     const result = await importWebsiteDatabase(sourcePath, dbPath, {
-      backupPath: join(root, "backups", "before-github-publication.db"), now,
+      backupPath: join(dataDir, "backups", "before-github-publication.db"), now,
     });
-    // Invalidate the application's in-memory series cache after a successful commit.
-    if (result.changes > 0) {
-      mkdirSync(join(root, "tmp"), { recursive: true });
-      writeFileSync(join(root, "tmp", "restart.txt"), `${new Date().toISOString()}\n`);
-    }
-    writeFileSync(`${statusPath}.tmp`, JSON.stringify({ commit, hash, completedAt: new Date().toISOString(), ...result }, null, 2));
-    renameSync(`${statusPath}.tmp`, statusPath);
+    // A previous attempt may have committed but failed before requesting restart.
+    // Only a completed receipt (the fast path above) can safely skip this step.
+    completePublication(root, statusPath, { commit, hash, ...result });
     console.log(`[website] PUBLISHED ${JSON.stringify(result)}`);
     return result;
   } finally {
-    if (!resolve(work).startsWith(`${resolve(root, "data")}${sep}.github-publication-`)) throw new Error("Invalid temporary directory.");
+    if (!resolve(work).startsWith(`${resolve(dataDir)}${sep}.github-publication-`)) throw new Error("Invalid temporary directory.");
     rmSync(work, { recursive: true, force: true });
   }
+}
+
+function completePublication(root, statusPath, result) {
+  mkdirSync(join(root, "tmp"), { recursive: true });
+  writeFileSync(join(root, "tmp", "restart.txt"), `${new Date().toISOString()}\n`);
+  writeFileSync(`${statusPath}.tmp`, JSON.stringify({ ...result, completedAt: new Date().toISOString() }, null, 2));
+  renameSync(`${statusPath}.tmp`, statusPath);
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

@@ -100,3 +100,21 @@ jobs:
           git pull --rebase origin "$BRANCH"
           git push origin "HEAD:$BRANCH"
           echo "Weather caches published." >> "$GITHUB_STEP_SUMMARY"
+      - name: Deliver and verify weather on Hostinger
+        if: ${{ github.ref == 'refs/heads/main' }}
+        env:
+          HOSTINGER_PUBLISH_KEY: ${{ secrets.HOSTINGER_PUBLISH_KEY }}
+        run: |
+          test -n "$HOSTINGER_PUBLISH_KEY" || { echo "HOSTINGER_PUBLISH_KEY is missing" >&2; exit 1; }
+          umask 077
+          key_file="$RUNNER_TEMP/hostinger-weather-key"
+          bundle="$RUNNER_TEMP/weather.json.gz"
+          trap 'rm -f "$key_file" "$bundle"' EXIT
+          printf '%s\n' "$HOSTINGER_PUBLISH_KEY" > "$key_file"
+          hash=$(node scripts/weather-publication.mjs "$bundle")
+          commit=$(git rev-parse HEAD)
+          ssh -p 65002 -i "$key_file" -o IdentitiesOnly=yes -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes -o UserKnownHostsFile=deploy/hostinger_known_hosts \
+            -o ConnectTimeout=15 u773681749@213.130.145.72 "publish-weather $commit $hash" < "$bundle"
+          node scripts/verify-website.mjs --weather
+          echo "Live website weather verified." >> "$GITHUB_STEP_SUMMARY"

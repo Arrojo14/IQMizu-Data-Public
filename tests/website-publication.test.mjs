@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import Database from "better-sqlite3";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import { createSchema, importOfficialRows } from "../scripts/sync-data.mjs";
@@ -90,7 +90,7 @@ test("an import failure rolls back corrections as well as newly inserted weeks",
 
 test("the restricted SSH receiver rejects shell commands and accepts only exact hashes", () => {
   const command = `publish ${"a".repeat(40)} ${"b".repeat(64)}`;
-  assert.deepEqual(parsePublishCommand(command), { commit: "a".repeat(40), hash: "b".repeat(64) });
+  assert.deepEqual(parsePublishCommand(command), { kind: "publish", commit: "a".repeat(40), hash: "b".repeat(64) });
   for (const invalid of ["ls", `${command}; pwd`, `${command}\n`, `publish main ${"b".repeat(64)}`, ""]) {
     assert.throws(() => parsePublishCommand(invalid), /Only/);
   }
@@ -110,6 +110,54 @@ test("a successful receipt skips future downloads and restarts but still rejects
   assert.equal(statSync(join(root, "tmp", "restart.txt")).mtimeMs, restartTime);
   assert.equal(describe(target).fecha, "2026-09-01");
   await assert.rejects(publishWebsiteData(command, { root, fetchImpl, now: new Date("2026-10-01") }), /desactualizada/);
+});
+
+test("delivery retries the restart after a committed import even when the database is unchanged", async (t) => {
+  const { source, root, target } = fixture(t);
+  const buffer = readFileSync(source);
+  const hash = createHash("sha256").update(buffer).digest("hex");
+  const command = `publish ${"a".repeat(40)} ${hash}`;
+  const options = { root, now, fetchImpl: async () => new Response(buffer) };
+  // Simulate a filesystem failure after SQLite commits but before restart/receipt.
+  writeFileSync(join(root, "tmp"), "restart directory unavailable");
+  await assert.rejects(publishWebsiteData(command, options), /EEXIST|ENOTDIR/);
+  assert.equal(describe(target).fecha, "2026-09-01");
+  assert.equal(existsSync(join(root, "data", "last-github-publication.json")), false);
+  unlinkSync(join(root, "tmp"));
+  assert.equal((await publishWebsiteData(command, options)).changes, 0);
+  assert.ok(existsSync(join(root, "tmp", "restart.txt")));
+  assert.ok(existsSync(join(root, "data", "last-github-publication.json")));
+});
+
+test("publication keeps database, backup and receipt outside the replaceable app directory", async (t) => {
+  const { source, root, target } = fixture(t);
+  const appRoot = join(root, "release");
+  mkdirSync(appRoot);
+  const buffer = readFileSync(source);
+  const hash = createHash("sha256").update(buffer).digest("hex");
+  const options = { root: appRoot, dbPath: target, now, fetchImpl: async () => new Response(buffer) };
+  const command = `publish ${"a".repeat(40)} ${hash}`;
+  await publishWebsiteData(command, options);
+  assert.equal(describe(target).fecha, "2026-09-01");
+  assert.equal(describe(join(root, "data", "backups", "before-github-publication.db")).fecha, "2026-08-11");
+  assert.ok(existsSync(join(root, "data", "last-github-publication.json")));
+  assert.ok(existsSync(join(appRoot, "tmp", "restart.txt")));
+  assert.equal(existsSync(join(appRoot, "data")), false);
+  assert.equal((await publishWebsiteData(command, options)).changes, 0);
+});
+
+test("invalid or stale incoming data preserves the website and its metadata", async (t) => {
+  const { source, target } = fixture(t);
+  const before = describe(target);
+  await assert.rejects(importWebsiteDatabase(source, target, { now: new Date("2026-10-01") }), /desactualizada/);
+  const incoming = new Database(source);
+  incoming.exec("UPDATE datos_semanales SET agua_actual_hm3 = -1 WHERE fecha = '2026-09-01'");
+  incoming.close();
+  await assert.rejects(importWebsiteDatabase(source, target, { now }), /no plausible/);
+  assert.deepEqual(describe(target), before);
+  const live = new Database(target, { readonly: true });
+  try { assert.equal(live.prepare("SELECT COUNT(*) AS n FROM embalses WHERE latitud = 41").get().n, 374); }
+  finally { live.close(); }
 });
 
 test("public verification waits for cache refresh and fails when the site stays stale", async () => {

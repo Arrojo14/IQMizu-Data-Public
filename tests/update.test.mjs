@@ -51,6 +51,14 @@ test("same reservoir name in different basins remains distinct", (t) => {
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM embalses").get().n, 2);
 });
 
+test("a long outage imports every pending week, including those outside the correction window", (t) => {
+  const db = memory(t);
+  importOfficialRows(db, week("2025-09-02"), "old");
+  importOfficialRows(db, [...week("2025-09-02"), ...week("2025-09-09"), ...week()], "new");
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM datos_semanales WHERE fecha = '2025-09-09'").get().n, 374);
+  assert.equal(getSnapshot(db).fecha, "2026-09-01");
+});
+
 test("migration removes redundant indexes and remains idempotent", (t) => {
   const db = memory(t);
   importOfficialRows(db, week(), "hash");
