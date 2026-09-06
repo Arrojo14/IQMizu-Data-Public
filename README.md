@@ -51,7 +51,24 @@ Los artefactos de AEMET se publican como JSON para que la app pueda servir:
 - GitHub serializa las ejecuciones con `concurrency`; se ha eliminado el wrapper con lock local. Estos scripts trabajan sobre el artefacto de este repositorio: no ejecutarlos simultaneamente ni sobre la SQLite abierta de la web.
 - GitHub puede retrasar u omitir eventos programados. Las dos ventanas evitan el inicio de la hora y permiten recuperacion automatica, pero no garantizan una hora exacta. Ver [documentacion de schedule](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule).
 - El cron solo queda activo cuando el workflow esta en la rama predeterminada. Ver los jobs `reservoirs` y `weather` por separado en Actions. Las notificaciones de fallos dependen de la configuracion de notificaciones de GitHub de cada usuario.
-- Publicar este repositorio no despliega la web de Hostinger: su DB se gestiona por separado.
+- En `main`, el job de embalses tambien publica y verifica la DB de Hostinger. Las ramas de prueba solo actualizan el repositorio.
+
+## Publicacion en Hostinger
+
+GitHub Actions invoca por SSH un receptor limitado a `publish <commit SHA> <database SHA-256>`. El servidor descarga la DB de ese commit y comprueba su huella, integridad, antiguedad e identificadores antes de importar. No necesita otro cron en Hostinger.
+
+El receptor conserva una copia SQLite consistente en `backups/before-github-publication.db` y aplica correcciones y semanas pendientes en una transaccion sobre la DB abierta de la web. Conserva los identificadores, los metadatos locales y los lectores WAL. Un fallo de importacion revierte la transaccion. Tras publicar, solicita el reinicio de Passenger mediante `tmp/restart.txt` para vaciar las caches y registra el resultado en `data/last-github-publication.json`.
+
+El workflow comprueba que `/api/nacional/historico` devuelve la fecha y los totales esperados. Si la entrega o la comprobacion fallan, el job falla y la siguiente ventana vuelve a intentarlo aunque la DB del repositorio no haya cambiado. Si ya esta aplicada, el receptor omite la descarga y el reinicio. AEMET publica sus JSON en el repositorio por separado; este receptor entrega solo la DB de embalses.
+
+Configuracion inicial (ya instalada en IQMizu):
+
+1. Instalar `scripts/publish-website-data.mjs` y `scripts/database-snapshot.mjs` en el directorio `scripts` de la app. Utilizan su dependencia existente `better-sqlite3` y Node.js 22.
+2. Crear una clave SSH exclusiva para Actions. Su entrada en `authorized_keys` debe usar `restrict` y un comando forzado: `/usr/bin/flock -n -E 75 /home/u773681749/domains/iqmizu.com/nodejs/data/.github-publication.lock /opt/alt/alt-nodejs22/root/usr/bin/node /home/u773681749/domains/iqmizu.com/nodejs/scripts/publish-website-data.mjs`. El lock serializa las entregas al servidor.
+3. Guardar la clave privada como secreto de Actions `HOSTINGER_PUBLISH_KEY`. `deploy/hostinger_known_hosts` fija la clave publica del servidor; verificar cualquier cambio antes de sustituirla.
+4. Ejecutar `Update public data` en `main` y comprobar el paso `Publish database to Hostinger` y el endpoint publico.
+
+La clave de Actions no permite ejecutar comandos arbitrarios ni subir codigo. Los cambios futuros del receptor requieren instalar esos dos scripts mediante el acceso administrativo existente. El despliegue habitual de la app debe conservarlos, junto con el directorio `data`.
 
 ## Comandos y comprobaciones
 

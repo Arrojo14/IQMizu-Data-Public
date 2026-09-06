@@ -45,6 +45,23 @@ jobs:
           git pull --rebase origin "$BRANCH"
           git push origin "HEAD:$BRANCH"
           echo "Reservoir database published." >> "$GITHUB_STEP_SUMMARY"
+      - name: Publish database to Hostinger
+        if: ${{ github.ref == 'refs/heads/main' }}
+        env:
+          HOSTINGER_PUBLISH_KEY: ${{ secrets.HOSTINGER_PUBLISH_KEY }}
+        run: |
+          test -n "$HOSTINGER_PUBLISH_KEY" || { echo "HOSTINGER_PUBLISH_KEY is missing" >&2; exit 1; }
+          umask 077
+          key_file="$RUNNER_TEMP/hostinger-publish-key"
+          trap 'rm -f "$key_file"' EXIT
+          printf '%s\n' "$HOSTINGER_PUBLISH_KEY" > "$key_file"
+          commit=$(git rev-parse HEAD)
+          hash=$(sha256sum data/embalses.db | cut -d ' ' -f 1)
+          ssh -p 65002 -i "$key_file" -o IdentitiesOnly=yes -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes -o UserKnownHostsFile=deploy/hostinger_known_hosts \
+            -o ConnectTimeout=15 u773681749@213.130.145.72 "publish $commit $hash"
+          node scripts/verify-website.mjs
+          echo "Live website database verified." >> "$GITHUB_STEP_SUMMARY"
       - name: Data summary
         run: npm run data:summary >> "$GITHUB_STEP_SUMMARY"
 
