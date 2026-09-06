@@ -7,31 +7,36 @@ Incluye solo:
 - `cuencas`
 - `embalses`
 - `datos_semanales`
+- `update_state` (huella del archivo oficial y ultima fecha oficial aplicada)
 - `data/cache/aemet-recent-climate-30.json`
 - `data/cache/aemet-monthly-*.json`
-- un cron de GitHub Actions listo para ejecutarse cada dia
+- actualizaciones de GitHub Actions a las 11:23 y 15:23 UTC
 
 No incluye:
 
 - el frontend de la web
 - secretos
-- tablas auxiliares no esenciales
 
 ## Que hace
 
-El flujo descarga el ZIP oficial de MITECO, localiza el `.mdb`, consulta el boletin provisional de BoleHWeb, y:
+El job `reservoirs` descarga el ZIP oficial de MITECO y compara su SHA-256 con el ultimo archivo importado. Si no cambia, omite la extraccion y lectura del MDB (mas de 700.000 filas). Cuando cambia, descubre la tabla por sus columnas, sin depender del ano de su nombre, y:
 
 - crea `data/embalses.db` desde cero si no existe
-- o la actualiza incrementalmente si ya existe
+- o reconcilia los ultimos 180 dias y todas las semanas pendientes si ya existe, conservando los identificadores
+- sustituye los valores provisionales por oficiales, incluso si ya existe esa fecha
 - aplica la ultima fecha provisional disponible en BoleHWeb cuando el ZIP oficial va con retraso
-- refresca el historico diario reciente de lluvia de AEMET para las estaciones activas
-- recalcula el acumulado mensual de AEMET a partir del historico diario
+- valida integridad, cobertura y antiguedad antes de reemplazar y publicar la DB
 
-La base generada contiene solo estas tablas:
+La actualizacion se prepara en una copia temporal. Un error de descarga, importacion o validacion conserva el archivo publicado. Una caida de BoleHWeb permite publicar los datos oficiales solo si la DB final sigue siendo valida y tiene como maximo 14 dias de antiguedad. Los datos incompletos o antiguos hacen fallar el job; no se confunde una ejecucion con datos frescos.
+
+El job independiente `weather` refresca AEMET una vez al dia, en la primera ventana, y tambien en las ejecuciones manuales. Se ejecuta despues del job de embalses y publica su propio commit. Un secreto AEMET ausente, un timeout o un error de su API no bloquea la publicacion de embalses. El historico anual de lluvia se mantiene completo; no se reconstruye otra vez en la ventana de recuperacion de embalses.
+
+La base generada contiene estas tablas:
 
 - `cuencas(id, nombre)`
 - `embalses(id, nombre, cuenca_id, capacidad_hm3, electrico)`
-- `datos_semanales(id, embalse_id, fecha, agua_actual_hm3, agua_total_hm3)`
+- `datos_semanales(id, embalse_id, fecha, agua_actual_hm3, agua_total_hm3, fuente)`
+- `update_state(clave, valor)`
 
 Los artefactos de AEMET se publican como JSON para que la app pueda servir:
 
@@ -39,7 +44,41 @@ Los artefactos de AEMET se publican como JSON para que la app pueda servir:
 - grafica mensual: `data/cache/aemet-monthly-*.json`
 ## Notas
 
-- La primera ejecucion puede tardar bastante mas que las siguientes porque regenera la DB y la cache historica de AEMET.
+- La primera ejecucion tras esta migracion necesita leer el MDB. Las siguientes solo vuelven a leerlo cuando cambia el ZIP.
 - GitHub puede avisar si `data/embalses.db` supera `50 MB`.
 - El origen de datos es MITECO y puede cambiar nombre/ruta del archivo con el tiempo.
-- El workflow hace commit tanto de `data/embalses.db` como de `data/cache/` cuando detecta cambios reales.
+- El workflow hace commits independientes de `data/embalses.db` y `data/cache/` cuando detecta cambios reales. Un fallo de commit o push se muestra como error.
+- GitHub serializa las ejecuciones con `concurrency`; se ha eliminado el wrapper con lock local. Estos scripts trabajan sobre el artefacto de este repositorio: no ejecutarlos simultaneamente ni sobre la SQLite abierta de la web.
+- GitHub puede retrasar u omitir eventos programados. Las dos ventanas evitan el inicio de la hora y permiten recuperacion automatica, pero no garantizan una hora exacta. Ver [documentacion de schedule](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule).
+- El cron solo queda activo cuando el workflow esta en la rama predeterminada. Ver los jobs `reservoirs` y `weather` por separado en Actions. Las notificaciones de fallos dependen de la configuracion de notificaciones de GitHub de cada usuario.
+- En `main`, el job de embalses tambien publica y verifica la DB de Hostinger. Las ramas de prueba solo actualizan el repositorio.
+
+## Publicacion en Hostinger
+
+GitHub Actions invoca por SSH un receptor limitado a `publish <commit SHA> <database SHA-256>`. El servidor descarga la DB de ese commit y comprueba su huella, integridad, antiguedad e identificadores antes de importar. No necesita otro cron en Hostinger.
+
+El receptor conserva una copia SQLite consistente en `backups/before-github-publication.db` y aplica correcciones y semanas pendientes en una transaccion sobre la DB abierta de la web. Conserva los identificadores, los metadatos locales y los lectores WAL. Un fallo de importacion revierte la transaccion. Tras publicar, solicita el reinicio de Passenger mediante `tmp/restart.txt` para vaciar las caches y registra el resultado en `data/last-github-publication.json`.
+
+El workflow comprueba que `/api/nacional/historico` devuelve la fecha y los totales esperados. Si la entrega o la comprobacion fallan, el job falla y la siguiente ventana vuelve a intentarlo aunque la DB del repositorio no haya cambiado. Si ya esta aplicada, el receptor omite la descarga y el reinicio. AEMET publica sus JSON en el repositorio por separado; este receptor entrega solo la DB de embalses.
+
+Configuracion inicial (ya instalada en IQMizu):
+
+1. Instalar `scripts/publish-website-data.mjs` y `scripts/database-snapshot.mjs` en el directorio `scripts` de la app. Utilizan su dependencia existente `better-sqlite3` y Node.js 22.
+2. Crear una clave SSH exclusiva para Actions. Su entrada en `authorized_keys` debe usar `restrict` y un comando forzado: `/usr/bin/flock -n -E 75 /home/u773681749/domains/iqmizu.com/nodejs/data/.github-publication.lock /opt/alt/alt-nodejs22/root/usr/bin/node /home/u773681749/domains/iqmizu.com/nodejs/scripts/publish-website-data.mjs`. El lock serializa las entregas al servidor.
+3. Guardar la clave privada como secreto de Actions `HOSTINGER_PUBLISH_KEY`. `deploy/hostinger_known_hosts` fija la clave publica del servidor; verificar cualquier cambio antes de sustituirla.
+4. Ejecutar `Update public data` en `main` y comprobar el paso `Publish database to Hostinger` y el endpoint publico.
+
+La clave de Actions no permite ejecutar comandos arbitrarios ni subir codigo. Los cambios futuros del receptor requieren instalar esos dos scripts mediante el acceso administrativo existente. El despliegue habitual de la app debe conservarlos, junto con el directorio `data`.
+
+## Comandos y comprobaciones
+
+Requiere Node.js 22 o superior; el runner usa Node.js 22 y `npm ci`.
+
+- `npm run data:update`: actualizar y validar embalses, sin depender de AEMET.
+- `npm run data:update:scheduled`: alias compatible del mismo comando.
+- `npm run data:update:aemet`: refrescar lluvia; requiere `AEMET_API_KEY`.
+- `npm run data:summary`: consultar fechas, cobertura y huellas de los artefactos.
+- `npm test`: pruebas aisladas sin red, incluidos errores de AEMET, correcciones oficiales y conservacion de la DB ante fallos.
+- `MITECO_LIVE_TEST=1 node --test --test-name-pattern='live MITECO' tests/update.test.mjs`: prueba real con una copia temporal de la DB; no modifica el artefacto publicado. En PowerShell, establecer antes `$env:MITECO_LIVE_TEST='1'`.
+
+Incidente de referencia: el [run del 2 de septiembre de 2026](https://github.com/Arrojo14/IQMizu-Data-Public/actions/runs/33665711547) completo MITECO y BoleHWeb, pero AEMET rechazo un rango historico valido y el workflow anterior omitio todo el commit. El fallo de AEMET y el aviso de runtime Node 20 de las acciones eran problemas distintos.

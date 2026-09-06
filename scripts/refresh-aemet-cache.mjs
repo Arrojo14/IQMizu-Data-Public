@@ -125,40 +125,25 @@ function parseCsvNumber(value) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-function isRetryableAemetError(error) {
+export function isRetryableAemetError(error) {
   return (
     error instanceof Error &&
-    (error.message.includes("AEMET API error: 429") ||
-      error.message.includes("AEMET API error: 500") ||
-      error.message.includes("AEMET API timeout") ||
-      error.message.includes("AEMET data timeout") ||
-      error.message.includes("AEMET data fetch error: 500"))
+    (error.name === "TimeoutError" || error.name === "AbortError" ||
+      error.message === "fetch failed" ||
+      /AEMET (?:API|data) error: (?:429|5\d\d)/.test(error.message) ||
+      // Observed intermittent upstream rejection of a correctly ordered date range.
+      error.message.includes("La fecha final no puede ser mayor que la fecha inicial"))
   );
 }
 
-async function fetchAemetDataOnce(endpoint) {
-  if (!AEMET_API_KEY) {
+export async function fetchAemetDataOnce(endpoint, { fetchImpl = fetch, apiKey = AEMET_API_KEY, timeoutMs = REQUEST_TIMEOUT_MS } = {}) {
+  if (!apiKey) {
     throw new Error("AEMET_API_KEY not configured");
   }
 
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-
-  let res;
-  try {
-    res = await fetch(`${AEMET_BASE}${endpoint}`, {
-      headers: { api_key: AEMET_API_KEY },
-      cache: "no-store",
-      signal: controller.signal,
-    });
-  } catch (error) {
-    if (error instanceof Error && error.name === "AbortError") {
-      throw new Error("AEMET API timeout");
-    }
-    throw error;
-  } finally {
-    clearTimeout(timeoutId);
-  }
+  const res = await fetchImpl(`${AEMET_BASE}${endpoint}`, {
+    headers: { api_key: apiKey }, cache: "no-store", signal: AbortSignal.timeout(timeoutMs),
+  });
 
   if (!res.ok) {
     throw new Error(`AEMET API error: ${res.status}`);
@@ -166,28 +151,15 @@ async function fetchAemetDataOnce(endpoint) {
 
   const meta = await res.json();
   if (meta?.estado !== 200 || !meta?.datos) {
-    throw new Error(`AEMET API returned: ${meta?.descripcion ?? "unknown error"}`);
+    throw new Error(`AEMET API error: ${meta?.estado ?? "unknown"}: ${meta?.descripcion ?? "unknown error"}`);
   }
 
-  const dataController = new AbortController();
-  const dataTimeoutId = setTimeout(() => dataController.abort(), REQUEST_TIMEOUT_MS);
-  let dataRes;
-  try {
-    dataRes = await fetch(meta.datos, {
-      cache: "no-store",
-      signal: dataController.signal,
-    });
-  } catch (error) {
-    if (error instanceof Error && error.name === "AbortError") {
-      throw new Error("AEMET data timeout");
-    }
-    throw error;
-  } finally {
-    clearTimeout(dataTimeoutId);
-  }
+  const dataRes = await fetchImpl(meta.datos, {
+    cache: "no-store", signal: AbortSignal.timeout(timeoutMs),
+  });
 
   if (!dataRes.ok) {
-    throw new Error(`AEMET data fetch error: ${dataRes.status}`);
+    throw new Error(`AEMET data error: ${dataRes.status}`);
   }
 
   return decodeJsonBuffer(await dataRes.arrayBuffer());

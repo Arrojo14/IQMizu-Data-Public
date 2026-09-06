@@ -1,9 +1,9 @@
 import Database from "better-sqlite3";
 import https from "node:https";
-import { existsSync, unlinkSync } from "node:fs";
 import { resolve } from "node:path";
+import { createSchema, getSnapshot, getState, validateSnapshot } from "./sync-data.mjs";
 
-const DB_PATH = resolve("data/embalses.db");
+const DB_PATH = resolve(process.env.SQLITE_DB_PATH || "data/embalses.db");
 const BOLEH_BASE_URL = "https://sede.miteco.gob.es/BoleHWeb";
 const REQUEST_TIMEOUT_MS = Number(process.env.BOLEH_TIMEOUT_MS || 30_000);
 const REQUESTED_DATE = process.env.BOLEH_DATE || formatDateForBoleh(new Date());
@@ -350,25 +350,15 @@ function sameNullableNumber(a, b) {
   return Math.abs(a - b) < 1e-9;
 }
 
-function cleanupDbSidecars() {
-  for (const filePath of [`${DB_PATH}-wal`, `${DB_PATH}-shm`]) {
-    try {
-      if (existsSync(filePath)) unlinkSync(filePath);
-    } catch {
-      // Ignore sidecar cleanup errors.
-    }
-  }
-}
-
 async function main() {
   if (!Number.isFinite(REQUEST_TIMEOUT_MS) || REQUEST_TIMEOUT_MS <= 0) {
     throw new Error("BOLEH_TIMEOUT_MS no es valido.");
   }
 
   const db = new Database(DB_PATH);
-  let shouldClose = true;
 
   try {
+    createSchema(db);
     console.log(`Consulta BoleHWeb para fecha solicitada: ${REQUESTED_DATE}`);
 
     const initialHtml = await fetchBoleh("/bolehSRV", {
@@ -399,11 +389,8 @@ async function main() {
     console.log(`Fecha efectiva del boletin: ${bulletinDateIso}`);
     console.log(`Ultima fecha actual en DB: ${latestDbDate}`);
 
-    if (bulletinDateIso < latestDbDate) {
-      console.log("La fecha provisional es anterior a la DB. No se aplica actualizacion.");
-      db.close();
-      shouldClose = false;
-      cleanupDbSidecars();
+    if (bulletinDateIso < latestDbDate || bulletinDateIso <= (getState(db, "miteco_official_latest_date") || "")) {
+      console.log("Boletin ya cubierto por la DB oficial o por una fecha posterior. Se omiten consultas por cuenca.");
       return;
     }
 
@@ -456,8 +443,11 @@ async function main() {
     }
 
     const rowsToUpsert = [...dataByEmbalseId.values()];
-    if (rowsToUpsert.length === 0) {
-      throw new Error("No se pudieron mapear datos provisionales a embalses locales.");
+    const minimumRows = Math.max(300, Math.ceil(getSnapshot(db).embalses * 0.9));
+    if (rowsToUpsert.length < minimumRows || rowsToUpsert.some((row) =>
+      row.aguaActualHm3 === null || row.aguaActualHm3 < 0 || !(row.aguaTotalHm3 > 0) ||
+      row.aguaActualHm3 > row.aguaTotalHm3 * 1.02)) {
+      throw new Error(`Boletin provisional incompleto o no plausible: ${rowsToUpsert.length}/${minimumRows} embalses.`);
     }
 
     const selectExisting = db.prepare(
@@ -466,12 +456,12 @@ async function main() {
        WHERE embalse_id = ? AND fecha = ?`
     );
     const insertDato = db.prepare(
-      `INSERT INTO datos_semanales (embalse_id, fecha, agua_actual_hm3, agua_total_hm3)
-       VALUES (?, ?, ?, ?)`
+      `INSERT INTO datos_semanales (embalse_id, fecha, agua_actual_hm3, agua_total_hm3, fuente)
+       VALUES (?, ?, ?, ?, 'provisional')`
     );
     const updateDato = db.prepare(
       `UPDATE datos_semanales
-       SET agua_actual_hm3 = ?, agua_total_hm3 = ?
+       SET agua_actual_hm3 = ?, agua_total_hm3 = ?, fuente = 'provisional'
        WHERE embalse_id = ? AND fecha = ?`
     );
 
@@ -499,6 +489,7 @@ async function main() {
         updateDato.run(row.aguaActualHm3, row.aguaTotalHm3, row.embalseId, row.fecha);
         updated += 1;
       }
+      validateSnapshot(getSnapshot(db));
     })(rowsToUpsert);
 
     const latestAfter = db.prepare("SELECT MAX(fecha) AS fecha FROM datos_semanales").get()?.fecha;
@@ -539,8 +530,7 @@ async function main() {
       if (unknownEmbalses.length > 20) console.warn(`  ... y ${unknownEmbalses.length - 20} mas`);
     }
   } finally {
-    if (shouldClose) db.close();
-    cleanupDbSidecars();
+    db.close();
   }
 }
 
