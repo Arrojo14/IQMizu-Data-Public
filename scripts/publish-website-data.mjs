@@ -26,6 +26,30 @@ export function snapshotsMatch(a, b) {
       Number.isFinite(a?.[key]) && Number.isFinite(b?.[key]) && Math.abs(a[key] - b[key]) < 0.01);
 }
 
+// MITECO files these reservoirs under the wrong province or community. The
+// import below never touches the website's provincia/comunidad columns, so the
+// receiver re-asserts these values on every publication. Rows that are already
+// correct are not written, and a row is only corrected while its name still
+// matches. Keep in sync with the app's src/data/reservoir-community-overrides.json.
+export const REGIONAL_CORRECTIONS = [
+  { id: 6, nombre: "Castrelo", provincia: "Ourense", comunidad: "Galicia" },
+  { id: 139, nombre: "Los Molinos", provincia: "Badajoz", comunidad: "Extremadura" },
+  { id: 196, nombre: "Montoro", provincia: "Ciudad Real", comunidad: "Castilla-La Mancha" },
+  { id: 316, nombre: "Peña, La", provincia: "Huesca", comunidad: "Aragón" },
+  { id: 324, nombre: "San Lorenzo", provincia: "Lleida", comunidad: "Catalunya" },
+  { id: 334, nombre: "Sistema Valle de Arán", provincia: "Lleida", comunidad: "Catalunya" },
+];
+
+/** Applies REGIONAL_CORRECTIONS inside the caller's transaction; returns rows changed. */
+export function correctRegions(db) {
+  const columns = new Set(db.prepare("SELECT name FROM pragma_table_info('embalses')").all().map((column) => column.name));
+  if (!columns.has("provincia") || !columns.has("comunidad")) return 0;
+  const update = db.prepare(`UPDATE embalses SET provincia = ?, comunidad = ?
+    WHERE id = ? AND nombre = ? AND (provincia IS NOT ? OR comunidad IS NOT ?)`);
+  return REGIONAL_CORRECTIONS.reduce((changes, { id, nombre, provincia, comunidad }) =>
+    changes + update.run(provincia, comunidad, id, nombre, provincia, comunidad).changes, 0);
+}
+
 export async function importWebsiteDatabase(sourcePath, dbPath, { backupPath, now = new Date() } = {}) {
   const incoming = new Database(sourcePath, { readonly: true });
   let live;
@@ -73,6 +97,7 @@ export async function importWebsiteDatabase(sourcePath, dbPath, { backupPath, no
           WHERE NOT EXISTS (SELECT 1 FROM datos_semanales target
             WHERE target.embalse_id = source.embalse_id AND target.fecha = source.fecha);
       `);
+      correctRegions(live);
       const after = describeDatabase(live);
       if (!snapshotsMatch(after, expected)) throw new Error("Imported database differs from the validated source; transaction rolled back.");
       return { before, after, changes: live.prepare("SELECT total_changes() AS n").get().n - changesBefore };
@@ -118,8 +143,20 @@ export async function publishWebsiteData(command, { root = ROOT, dbPath = resolv
   try { current = describeDatabase(live); } finally { live.close(); }
   if (last?.hash === hash && snapshotsMatch(last.after, current)) {
     validateSnapshot(current, { now });
-    console.log(`[website] UNCHANGED ${JSON.stringify(current)}`);
-    return { after: current, changes: 0 };
+    // Same data as last time; still apply regional corrections added since.
+    const db = new Database(dbPath, { fileMustExist: true });
+    let changes;
+    try {
+      db.pragma("busy_timeout = 30000");
+      changes = db.transaction(() => correctRegions(db)).immediate();
+    } finally { db.close(); }
+    if (changes > 0) {
+      completePublication(root, statusPath, { commit, hash, after: current, changes });
+      console.log(`[website] CORRECTED ${changes} regional rows`);
+    } else {
+      console.log(`[website] UNCHANGED ${JSON.stringify(current)}`);
+    }
+    return { after: current, changes };
   }
 
   const work = mkdtempSync(join(dataDir, ".github-publication-"));

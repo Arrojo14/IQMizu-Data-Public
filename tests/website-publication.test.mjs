@@ -6,7 +6,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, unl
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import { createSchema, importOfficialRows } from "../scripts/sync-data.mjs";
-import { describeDatabase, importWebsiteDatabase, parsePublishCommand, publishWebsiteData } from "../scripts/publish-website-data.mjs";
+import { correctRegions, describeDatabase, importWebsiteDatabase, parsePublishCommand, publishWebsiteData, REGIONAL_CORRECTIONS } from "../scripts/publish-website-data.mjs";
 import { verifyWebsite } from "../scripts/verify-website.mjs";
 
 const now = new Date("2026-09-06T12:00:00Z");
@@ -184,4 +184,41 @@ test("public verification retries CDN errors, honours retry-after and logs each 
   assert.match(lines[0], /attempt 1\/24 failed: Website HTTP 429: Too many requests/);
   assert.match(lines[1], /HTTP 503: <html>Service Unavailable/);
   assert.match(lines[2], /verified/);
+});
+
+test("regional corrections are applied once, only to rows whose name still matches", () => {
+  const db = new Database(":memory:");
+  try {
+    db.exec("CREATE TABLE embalses (id INTEGER PRIMARY KEY, nombre TEXT, provincia TEXT, comunidad TEXT)");
+    const insert = db.prepare("INSERT INTO embalses VALUES (?, ?, 'Wrong', 'Wrong')");
+    for (const { id, nombre } of REGIONAL_CORRECTIONS) insert.run(id, id === 324 ? "Renamed" : nombre);
+    assert.equal(correctRegions(db), REGIONAL_CORRECTIONS.length - 1);
+    assert.equal(correctRegions(db), 0, "idempotent");
+    assert.deepEqual(db.prepare("SELECT provincia, comunidad FROM embalses WHERE id = 6").get(), { provincia: "Ourense", comunidad: "Galicia" });
+    assert.equal(db.prepare("SELECT provincia FROM embalses WHERE id = 324").get().provincia, "Wrong");
+  } finally { db.close(); }
+  const bare = new Database(":memory:");
+  try {
+    bare.exec("CREATE TABLE embalses (id INTEGER PRIMARY KEY, nombre TEXT)");
+    assert.equal(correctRegions(bare), 0, "databases without regional columns are left alone");
+  } finally { bare.close(); }
+});
+
+test("an unchanged publication still applies new regional corrections and requests a restart", async (t) => {
+  const { source, root, target } = fixture(t);
+  const buffer = readFileSync(source);
+  const hash = createHash("sha256").update(buffer).digest("hex");
+  const command = `publish ${"b".repeat(40)} ${hash}`;
+  await publishWebsiteData(command, { root, fetchImpl: async () => new Response(buffer), now });
+  const db = new Database(target);
+  db.exec("ALTER TABLE embalses ADD COLUMN provincia TEXT; ALTER TABLE embalses ADD COLUMN comunidad TEXT;");
+  db.prepare("UPDATE embalses SET nombre = 'Castrelo', provincia = 'A Coruña', comunidad = 'Galicia' WHERE id = 6").run();
+  db.close();
+  const fetchImpl = async () => { throw new Error("must not download"); };
+  assert.equal((await publishWebsiteData(command, { root, fetchImpl, now })).changes, 1);
+  const check = new Database(target, { readonly: true });
+  try { assert.equal(check.prepare("SELECT provincia FROM embalses WHERE id = 6").get().provincia, "Ourense"); } finally { check.close(); }
+  const receipt = JSON.parse(readFileSync(join(root, "data", "last-github-publication.json"), "utf8"));
+  assert.equal(receipt.changes, 1);
+  assert.equal((await publishWebsiteData(command, { root, fetchImpl, now })).changes, 0);
 });
