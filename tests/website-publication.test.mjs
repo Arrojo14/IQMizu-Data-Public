@@ -122,3 +122,18 @@ test("public verification waits for cache refresh and fails when the site stays 
   assert.equal((await verifyWebsite(expected, { fetchImpl, attempts: 2, delayMs: 1 })).fecha, expected.fecha);
   await assert.rejects(verifyWebsite(expected, { fetchImpl: async () => Response.json([]), attempts: 1 }), /does not match/);
 });
+
+test("public verification retries CDN errors, honours retry-after and logs each failure", async () => {
+  const expected = { fecha: "2026-09-01", aguaActualHm3: 35875, aguaTotalHm3: 56043 };
+  const responses = [
+    new Response("Too many requests", { status: 429, headers: { "retry-after": "0" } }),
+    new Response("<html>Service Unavailable</html>", { status: 503 }),
+    Response.json([{ fecha: "2026-09-01", agua_actual_hm3: 35875, agua_total_hm3: 56043 }]),
+  ];
+  const lines = [];
+  const latest = await verifyWebsite(expected, { fetchImpl: async () => responses.shift(), delayMs: 1, maxDelayMs: 1, log: (line) => lines.push(line) });
+  assert.equal(latest.fecha, expected.fecha);
+  assert.match(lines[0], /Attempt 1\/24 failed: Website HTTP 429: Too many requests/);
+  assert.match(lines[1], /HTTP 503: <html>Service Unavailable/);
+  assert.match(lines[2], /verified/);
+});
