@@ -5,21 +5,33 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { getSnapshot, validateSnapshot } from "./database-snapshot.mjs";
 import { readWeatherFiles, validateWeatherFiles } from "./weather-publication.mjs";
 
-async function verifyResponse(path, matches, { fetchImpl = fetch, attempts = 24, delayMs = 5000, baseUrl = "https://iqmizu.com" } = {}) {
+const USER_AGENT = "IQMizu-Data-Public publication check (+https://github.com/Arrojo14/IQMizu-Data-Public)";
+
+// The public check runs through Hostinger's CDN, which can answer with short
+// 429/5xx bursts. Retry for about 8 minutes with backoff and log every failed
+// attempt so a failing run says why.
+async function verifyResponse(path, matches, { fetchImpl = fetch, attempts = 24, delayMs = 5000, maxDelayMs = 30_000,
+  baseUrl = "https://iqmizu.com", log = console.log } = {}) {
   let lastError;
   for (let attempt = 1; attempt <= attempts; attempt++) {
+    let retryAfterMs = 0;
     try {
       const response = await fetchImpl(`${baseUrl}${path}?publication=${Date.now()}`, {
-        signal: AbortSignal.timeout(10_000), cache: "no-store",
+        signal: AbortSignal.timeout(15_000), cache: "no-store", headers: { "user-agent": USER_AGENT },
       });
-      if (!response.ok) throw new Error(`Website HTTP ${response.status}`);
+      if (!response.ok) {
+        retryAfterMs = Math.min(Number(response.headers.get("retry-after")) * 1000 || 0, 120_000);
+        const body = (await response.text().catch(() => "")).replace(/\s+/g, " ").slice(0, 160);
+        throw new Error(`Website HTTP ${response.status}${body ? `: ${body}` : ""}`);
+      }
       const value = await response.json();
-      if (!matches(value)) throw new Error(`Website does not match published data: ${path}`);
-      console.log(`[website] Public API verified: ${path}`);
+      if (!matches(value)) throw new Error(`Website does not match published data: ${path} ${JSON.stringify(value).slice(0, 200)}`);
+      log(`[website] Public API verified: ${path}`);
       return value;
     } catch (error) {
       lastError = error;
-      if (attempt < attempts) await sleep(delayMs);
+      log(`[website] ${path} attempt ${attempt}/${attempts} failed: ${error.message}`);
+      if (attempt < attempts) await sleep(Math.max(retryAfterMs, Math.min(delayMs * 2 ** Math.floor((attempt - 1) / 4), maxDelayMs)));
     }
   }
   throw lastError;
