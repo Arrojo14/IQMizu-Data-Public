@@ -5,3 +5,45 @@ data/*-wal
 data/*-shm
 data/cache/*.tmp
 data/.miteco-*/
+
+# Local secrets and credentials (keep only a placeholder .env.example)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+id_ecdsa*
+id_dsa*
+
+# Receiver state, backups and restart markers if the receiver is run locally
+backups/
+data/backups/
+tmp/
+last-github-publication.json
+last-weather-publication.json
+.github-publication.lock
+*.bak
+*.db.tmp
+
+# Logs, archives and debug output
+*.log
+npm-debug.log*
+logs/
+*.tgz
+*.tar.gz
+*.zip
+artifacts/
+coverage/
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*~
+.vscode/
+.idea/
