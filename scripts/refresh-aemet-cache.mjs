@@ -22,6 +22,7 @@ const RECENT_OBS_DELAY_MS = Number(process.env.AEMET_RECENT_OBS_DELAY_MS || 100)
 const RECENT_OBS_MAX_RETRIES = Number(process.env.AEMET_RECENT_OBS_MAX_RETRIES || 3);
 const RECENT_OBS_TIMEOUT_MS = Number(process.env.AEMET_RECENT_OBS_TIMEOUT_MS || REQUEST_TIMEOUT_MS);
 const AEMET_REQUIRED = process.env.AEMET_REQUIRED !== "0";
+const AEMET_FULL_HISTORY = process.env.AEMET_FULL_HISTORY === "1";
 
 loadEnvFile(resolve(".env.local"));
 loadEnvFile(resolve(".env"));
@@ -517,6 +518,29 @@ function buildRecentClimatePayload(pointsByStation, recentRangeDays, timestamp) 
   };
 }
 
+// The cache already holds every earlier day, so only the recent stretch is
+// downloaded again: from the first of the month that falls 30 days before the
+// newest day held (or before endDate, if earlier). Each month in that window is
+// re-summed whole, AEMET's late corrections to recent weeks are picked up, and a
+// gap since the last run is filled. The full LOOKBACK_DAYS is downloaded without
+// a usable cache, on the first of each month (so stations that joined since get
+// their year back), or with AEMET_FULL_HISTORY=1.
+export function historyStartDate(previousRecent, endDate, { lookbackDays = LOOKBACK_DAYS, full = AEMET_FULL_HISTORY } = {}) {
+  const fullStart = addDays(endDate, -lookbackDays);
+  if (full || endDate.getUTCDate() === 1) return fullStart;
+  let newest = "";
+  for (const points of Object.values(previousRecent ?? {})) {
+    const last = Array.isArray(points) ? points.at(-1)?.fecha : undefined;
+    if (typeof last === "string" && last > newest) newest = last;
+  }
+  if (!newest) return fullStart;
+  const anchor = new Date(`${newest}T00:00:00Z`) < endDate ? new Date(`${newest}T00:00:00Z`) : new Date(endDate);
+  const start = addDays(anchor, -30);
+  start.setUTCDate(1);
+  start.setUTCHours(0, 0, 0, 0);
+  return start > fullStart ? start : fullStart;
+}
+
 export async function refreshAemetCaches() {
   validatePositiveInteger("AEMET_RECENT_RANGE_DAYS", RECENT_RANGE_DAYS);
   validatePositiveInteger("AEMET_HISTORY_RANGE_DAYS", LOOKBACK_DAYS);
@@ -557,7 +581,12 @@ export async function refreshAemetCaches() {
   const indicativoSet = new Set(indicativos);
   const endDate = new Date();
   endDate.setDate(endDate.getDate() - 1);
-  const startDate = addDays(endDate, -LOOKBACK_DAYS);
+  // Keep last-known history for dormant/missing stations. A partial upstream
+  // response must not erase earlier published months or station history.
+  const files = existsSync(CACHE_DIR) ? readWeatherFiles(CACHE_DIR) : {};
+  const previousRecent = files["aemet-recent-climate-30.json"]?.data ?? {};
+  const startDate = historyStartDate(previousRecent, endDate);
+  console.log(`[aemet-cache] Historico desde ${formatAemetDate(startDate)} (${formatAemetDate(startDate) <= formatAemetDate(addDays(endDate, -LOOKBACK_DAYS)) ? "completo" : "incremental"}).`);
   const merged = new Map(indicativos.map((indicativo) => [indicativo, []]));
 
   let chunkStart = new Date(startDate);
@@ -606,10 +635,6 @@ export async function refreshAemetCaches() {
   const recentPayload = buildRecentClimatePayload(finalized, RECENT_RANGE_DAYS, timestamp);
   const recentFilePath = join(CACHE_DIR, `aemet-recent-climate-${RECENT_RANGE_DAYS}.json`);
 
-  // Keep last-known history for dormant/missing stations. A partial upstream
-  // response must not erase earlier published months or station history.
-  const files = existsSync(CACHE_DIR) ? readWeatherFiles(CACHE_DIR) : {};
-  const previousRecent = files["aemet-recent-climate-30.json"]?.data ?? {};
   for (const [station, points] of Object.entries(previousRecent)) {
     const combined = new Map(points.map((point) => [point.fecha, point]));
     for (const point of recentPayload.data[station] ?? []) combined.set(point.fecha, point);

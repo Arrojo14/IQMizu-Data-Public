@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { createSchema, getSnapshot, getState, importOfficialRows, readOfficialRows, syncData, validateSnapshot, downloadArchive } from "../scripts/sync-data.mjs";
-import { fetchAemetDataOnce, isRetryableAemetError } from "../scripts/refresh-aemet-cache.mjs";
+import { fetchAemetDataOnce, historyStartDate, isRetryableAemetError } from "../scripts/refresh-aemet-cache.mjs";
 
 const now = new Date("2026-09-06T12:00:00Z");
 function week(fecha = "2026-09-01", count = 374, water = 50) {
@@ -169,4 +169,21 @@ test("live MITECO archive updates a copy and skips parsing on repeat", { skip: p
   assert.deepEqual(repeat, first);
   assert.deepEqual(readFileSync(dbPath), published);
   console.log(JSON.stringify({ firstMs, repeatMs: performance.now() - repeatStart, bytes: published.length, snapshot: repeat }));
+});
+
+test("AEMET history downloads only the recent stretch when the cache is current", () => {
+  const day = (date) => date.toISOString().slice(0, 10);
+  const end = new Date("2026-10-11T20:00:00Z");
+  const held = { A: [{ fecha: "2026-10-08" }], B: [{ fecha: "2026-10-09" }], C: [] };
+  // 30 days before the newest day held (2026-10-09) is 2026-09-09: the window starts on the 1st.
+  assert.equal(day(historyStartDate(held, end, { full: false })), "2026-09-01");
+  // A newest day after endDate (a provisional overlay) anchors on endDate instead.
+  assert.equal(day(historyStartDate({ A: [{ fecha: "2026-10-20" }] }, end, { full: false })), "2026-09-01");
+  // A long gap since the last run reaches back further, never past the lookback.
+  assert.equal(day(historyStartDate({ A: [{ fecha: "2026-07-15" }] }, end, { full: false })), "2026-06-01");
+  assert.equal(day(historyStartDate({ A: [{ fecha: "2025-01-01" }] }, end, { full: false })), "2025-10-12");
+  // Full download: no cache, forced, or the first of the month.
+  assert.equal(day(historyStartDate({}, end, { full: false })), "2025-10-12");
+  assert.equal(day(historyStartDate(held, end, { full: true })), "2025-10-12");
+  assert.equal(day(historyStartDate(held, new Date("2026-11-01T20:00:00Z"), { full: false })), "2025-11-02");
 });

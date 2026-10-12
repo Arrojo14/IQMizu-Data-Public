@@ -78,7 +78,7 @@ Configuracion para la proxima version:
 3. Conservar el secreto `HOSTINGER_PUBLISH_KEY` y `deploy/hostinger_known_hosts`; verificar cualquier cambio de clave del servidor antes de sustituirla. La clave de Actions no permite shell arbitraria, subida de codigo ni destinos elegidos por el cliente.
 4. Configurar el mismo `SQLITE_DB_PATH` para Passenger, activar el workflow y comprobar ambas entregas. No instalar otro cron de datos en Hostinger.
 
-AEMET sigue siendo independiente: una caida de su API no bloquea embalses. Su generador combina las respuestas con el ultimo historico valido y valida el conjunto antes de escribir; no borra estaciones ausentes ni meses anteriores por una respuesta parcial. Los JSON publicados conservan sus rutas y formatos.
+AEMET sigue siendo independiente: una caida de su API no bloquea embalses. Su generador combina las respuestas con el ultimo historico valido y valida el conjunto antes de escribir; no borra estaciones ausentes ni meses anteriores por una respuesta parcial. Solo descarga de nuevo el tramo reciente: desde el dia 1 del mes que cae 30 dias antes del ultimo dia ya guardado, asi cada mes de ese tramo se vuelve a sumar entero y entran las correcciones tardias de AEMET. Descarga el año completo (`AEMET_HISTORY_RANGE_DAYS`, 364 dias) si no hay cache, el dia 1 de cada mes (para que las estaciones nuevas recuperen su año) o con `AEMET_FULL_HISTORY=1`. Los JSON publicados conservan sus rutas y formatos.
 
 ## Comandos y comprobaciones
 
