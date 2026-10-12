@@ -90,14 +90,29 @@ test("weather delivery uses external persistent state, retries after restart fai
   assert.equal(readFileSync(dbPath, "utf8"), "reservoir database must remain untouched");
 });
 
-test("weather verification checks the public recent summary and actual monthly responses", async () => {
+test("weather verification checks the public recent summary, monthly responses and a station page", async () => {
   const files = weather();
   const expected = validateWeatherFiles(files, { now });
-  const options = { now, attempts: 1, fetchImpl: async (url) => {
+  const pages = [];
+  const site = (pageDate, missing = () => false) => async (url) => {
     const station = /\/estacion\/(S\d+)\/mensual/.exec(url)?.[1];
-    return Response.json(station ? files[`aemet-monthly-${station}.json`].data : { weather: expected });
-  } };
-  await verifyWebsiteWeather(files, options);
+    if (station) return Response.json(files[`aemet-monthly-${station}.json`].data);
+    const page = /\/estacion\/(S\d+)\?/.exec(url)?.[1];
+    if (!page) return Response.json({ weather: expected });
+    pages.push(page);
+    if (missing(page)) return new Response("Not found", { status: 404 });
+    return new Response(`<script>self.__next_f.push([1,"{\\"fecha\\":\\"${pageDate}\\",\\"precipitacion\\":1}"])</script>`);
+  };
+  const options = { now, attempts: 1, log: () => {} };
+  await verifyWebsiteWeather(files, { ...options, fetchImpl: site("2026-09-05") });
+  assert.equal(pages.length, 1);
+  await assert.rejects(verifyWebsiteWeather(files, { ...options, fetchImpl: site("2026-09-04") }), /page shows older data/);
+  // A station without a page on the site is skipped for the next one.
+  pages.length = 0;
+  await verifyWebsiteWeather(files, { ...options, fetchImpl: site("2026-09-05", (page) => pages.length === 1) });
+  assert.equal(pages.length, 2);
+  assert.notEqual(pages[0], pages[1]);
+  await assert.rejects(verifyWebsiteWeather(files, { ...options, fetchImpl: site("2026-09-05", () => true) }), /No station page found/);
   await assert.rejects(verifyWebsiteWeather(files, { ...options, fetchImpl: async () => Response.json({ weather: null }) }), /does not match/);
 });
 

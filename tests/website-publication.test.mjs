@@ -163,12 +163,19 @@ test("invalid or stale incoming data preserves the website and its metadata", as
 test("public verification waits for cache refresh and fails when the site stays stale", async () => {
   const expected = { fecha: "2026-09-01", aguaActualHm3: 35875, aguaTotalHm3: 56043 };
   let attempts = 0;
-  const fetchImpl = async () => {
+  const home = (date) => new Response(`<p>Actualizado ${date}</p>`);
+  const fetchImpl = async (url) => {
+    if (new URL(url).pathname === "/") return home("1 de septiembre de 2026");
     attempts++;
     return Response.json([{ fecha: attempts === 1 ? "2026-08-11" : "2026-09-01", agua_actual_hm3: 35875, agua_total_hm3: 56043 }]);
   };
-  assert.equal((await verifyWebsite(expected, { fetchImpl, attempts: 2, delayMs: 1 })).fecha, expected.fecha);
-  await assert.rejects(verifyWebsite(expected, { fetchImpl: async () => Response.json([]), attempts: 1 }), /does not match/);
+  const log = () => {};
+  assert.equal((await verifyWebsite(expected, { fetchImpl, attempts: 2, delayMs: 1, log })).fecha, expected.fecha);
+  await assert.rejects(verifyWebsite(expected, { fetchImpl: async () => Response.json([]), attempts: 1, log }), /does not match/);
+  // The API can be current while Inicio still comes from an older render.
+  const staleHome = async (url) => new URL(url).pathname === "/" ? home("11 de agosto de 2026")
+    : Response.json([{ fecha: "2026-09-01", agua_actual_hm3: 35875, agua_total_hm3: 56043 }]);
+  await assert.rejects(verifyWebsite(expected, { fetchImpl: staleHome, attempts: 1, log }), /page shows older data/);
 });
 
 test("public verification retries CDN errors, honours retry-after and logs each failure", async () => {
@@ -177,6 +184,7 @@ test("public verification retries CDN errors, honours retry-after and logs each 
     new Response("Too many requests", { status: 429, headers: { "retry-after": "0" } }),
     new Response("<html>Service Unavailable</html>", { status: 503 }),
     Response.json([{ fecha: "2026-09-01", agua_actual_hm3: 35875, agua_total_hm3: 56043 }]),
+    new Response("<p>Actualizado 1 de septiembre de 2026</p>"),
   ];
   const lines = [];
   const latest = await verifyWebsite(expected, { fetchImpl: async () => responses.shift(), delayMs: 1, maxDelayMs: 1, log: (line) => lines.push(line) });
