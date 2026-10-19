@@ -132,6 +132,12 @@ export function isRetryableAemetError(error) {
   );
 }
 
+// AEMET publishes daily climate values a few days late, and answers a range
+// that holds only those days with a 404 envelope instead of an empty list.
+export function isAemetNoDataError(error) {
+  return error instanceof Error && /AEMET API error: 404: No hay datos/.test(error.message);
+}
+
 export async function fetchAemetDataOnce(endpoint, { fetchImpl = fetch, apiKey = AEMET_API_KEY, timeoutMs = REQUEST_TIMEOUT_MS } = {}) {
   if (!apiKey) {
     throw new Error("AEMET_API_KEY not configured");
@@ -602,7 +608,14 @@ export async function refreshAemetCaches() {
       `[aemet-cache] Descargando tramo ${chunkCount}: ${formatAemetDate(chunkStart)} -> ${formatAemetDate(effectiveEnd)}`
     );
 
-    const rawChunk = await fetchAllStationsDailyClimateChunk(chunkStart, effectiveEnd);
+    let rawChunk;
+    try {
+      rawChunk = await fetchAllStationsDailyClimateChunk(chunkStart, effectiveEnd);
+    } catch (error) {
+      if (!isAemetNoDataError(error)) throw error;
+      console.warn(`[aemet-cache] AEMET aun no publica el tramo ${chunkCount}; se omite.`);
+      rawChunk = [];
+    }
     const chunk = Array.isArray(rawChunk) ? rawChunk : [];
     totalRawRows += chunk.length;
 
@@ -624,6 +637,10 @@ export async function refreshAemetCaches() {
     if (chunkStart <= endDate && CHUNK_DELAY_MS > 0) {
       await sleep(CHUNK_DELAY_MS);
     }
+  }
+
+  if (totalRawRows === 0) {
+    throw new Error("AEMET no devolvio valores climatologicos para ningun tramo.");
   }
 
   const finalized = finalizeDailyPoints(merged);

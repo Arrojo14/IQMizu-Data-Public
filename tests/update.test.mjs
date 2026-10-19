@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { createSchema, getSnapshot, getState, importOfficialRows, readOfficialRows, syncData, validateSnapshot, downloadArchive } from "../scripts/sync-data.mjs";
-import { fetchAemetDataOnce, historyStartDate, isRetryableAemetError } from "../scripts/refresh-aemet-cache.mjs";
+import { fetchAemetDataOnce, historyStartDate, isAemetNoDataError, isRetryableAemetError } from "../scripts/refresh-aemet-cache.mjs";
 
 const now = new Date("2026-09-06T12:00:00Z");
 function week(fecha = "2026-09-01", count = 374, water = 50) {
@@ -144,6 +144,17 @@ test("AEMET HTTP-200 error envelopes retain retryable status and reject credenti
     });
   }
   assert.ok(isRetryableAemetError(new Error("AEMET API error: 400: La fecha final no puede ser mayor que la fecha inicial")));
+});
+
+test("AEMET no-data envelope for days not yet published is recognised and not retried", async () => {
+  await assert.rejects(fetchAemetDataOnce("/test", { apiKey: "fixture", fetchImpl: async () =>
+    Response.json({ estado: 404, descripcion: "No hay datos que satisfagan esos criterios" }) }), (error) => {
+    assert.ok(isAemetNoDataError(error));
+    assert.equal(isRetryableAemetError(error), false);
+    return true;
+  });
+  assert.equal(isAemetNoDataError(new Error("AEMET data error: 404")), false);
+  assert.equal(isAemetNoDataError(new Error("AEMET API error: 401: API key invalido")), false);
 });
 
 test("AEMET timeout remains active while reading the response body", async () => {
